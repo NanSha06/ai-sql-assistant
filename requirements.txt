@@ -1,21 +1,32 @@
-# AI SQL Assistant - Python Dependencies
-# Install with: pip install -r requirements.txt
-
-# --- UI ---
+# ─── Core framework ───────────────────────────────────────────────────────────
 streamlit>=1.35.0
+langchain>=0.2.0
+langchain-community>=0.2.0
+langchain-openai>=0.1.0          # used for NVIDIA NIM OpenAI-compatible endpoint
 
-# --- LangChain Core ---
-langchain>=0.3.0
-langchain-core>=0.3.28
-langchain-community>=0.3.0
+# ─── LLM & Embedding API ──────────────────────────────────────────────────────
+openai>=1.30.0                   # NVIDIA NIM uses the OpenAI-compatible API
 
-# --- LangChain OpenAI (used for NVIDIA NIM via OpenAI-compatible API) ---
-langchain-openai>=0.2.0
-openai>=1.30.0
-
-# --- Database ---
-sqlalchemy>=2.0.0
+# ─── Database ─────────────────────────────────────────────────────────────────
 psycopg2-binary>=2.9.9
+sqlalchemy>=2.0.0
 
-# --- Environment Variables ---
+# ─── RAG — Vector store ───────────────────────────────────────────────────────
+chromadb>=0.5.0
+
+# ─── RAG — Embeddings ─────────────────────────────────────────────────────────
+sentence-transformers>=3.0.0     # local fallback; primary embeddings via NVIDIA NIM
+
+# ─── RAG — Language detection ─────────────────────────────────────────────────
+langdetect>=1.0.9
+
+# ─── Visualisation (Phase 6 analytics layer) ──────────────────────────────────
+plotly>=5.22.0
+altair>=5.3.0
+
+# ─── Config ───────────────────────────────────────────────────────────────────
 python-dotenv>=1.0.0
+
+# ─── Utilities ────────────────────────────────────────────────────────────────
+tiktoken>=0.7.0                  # token counting for chunk size estimation
+pandas>=2.2.0                    # result DataFrames & chart data prep
