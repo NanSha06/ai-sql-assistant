@@ -5,12 +5,12 @@
 streamlit>=1.35.0
 
 # --- LangChain Core ---
-langchain>=0.2.0
-langchain-core>=0.2.0
-langchain-community>=0.2.0
+langchain>=0.3.0
+langchain-core>=0.3.28
+langchain-community>=0.3.0
 
 # --- LangChain OpenAI (used for NVIDIA NIM via OpenAI-compatible API) ---
-langchain-openai>=0.1.0
+langchain-openai>=0.2.0
 openai>=1.30.0
 
 # --- Database ---

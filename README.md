@@ -2,7 +2,7 @@
 
 > Ask questions in plain English. Get SQL queries back. Instantly.
 
-Built with **LangChain**, **PostgreSQL**, **Streamlit**, and **NVIDIA NIM** (free tier) using the `nvidia/llama-3.1-nemotron-nano-8b-healthcare-text2sql-v1.0` model — purpose-built for Text-to-SQL tasks.
+Built with **LangChain**, **PostgreSQL**, **Streamlit**, and **NVIDIA NIM** (free tier) using the `mistralai/mistral-large-3-675b-instruct-2512` model — a state-of-the-art 675B instruction-following model available as a free API endpoint on NVIDIA NIM.
 
 ---
 
@@ -10,9 +10,9 @@ Built with **LangChain**, **PostgreSQL**, **Streamlit**, and **NVIDIA NIM** (fre
 
 - 💬 Natural language to SQL conversion
 - 🗄️ Connects to any PostgreSQL database
-- 🧠 Powered by NVIDIA NIM's free Text-to-SQL model
+- 🧠 Powered by NVIDIA NIM's free Mistral Large 3 endpoint
 - ⚡ LangChain SQL Agent for multi-step query reasoning
-- 🖥️ Clean Streamlit UI with query display toggle
+- 🖥️ Clean Streamlit UI with generated SQL display toggle
 - 🔒 Schema-aware prompting using your actual DDL
 
 ---
@@ -26,8 +26,9 @@ ai-sql-assistant/
 ├── chain.py            # LangChain SQL agent setup
 ├── prompts.py          # Custom prompt templates
 ├── .env                # API keys & DB credentials (never commit this)
-├── .env.example        # Example env file
+├── .env.example        # Example env file — safe to commit
 ├── requirements.txt    # Python dependencies
+├── .gitignore
 └── README.md
 ```
 
@@ -38,33 +39,29 @@ ai-sql-assistant/
 ### 1. Clone the repository
 
 ```bash
-git clone https://github.com/your-username/ai-sql-assistant.git
+git clone https://github.com/NanSha06/ai-sql-assistant.git
 cd ai-sql-assistant
 ```
 
-### 2. Create and activate a virtual environment
-
-```bash
-python -m venv venv
-source venv/bin/activate        # Linux/macOS
-venv\Scripts\activate           # Windows
-```
-
-### 3. Install dependencies
+### 2. Install dependencies
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 4. Set up environment variables
+### 3. Set up environment variables
 
-Copy the example env file and fill in your credentials:
+Create a `.env` file in the project root:
 
 ```bash
-cp .env.example .env
+# Windows
+type nul > .env
+
+# macOS/Linux
+touch .env
 ```
 
-Edit `.env`:
+Add your credentials:
 
 ```env
 NVIDIA_API_KEY=nvapi-xxxxxxxxxxxxxxxxxxxx
@@ -75,14 +72,14 @@ DB_USER=postgres
 DB_PASS=your_password
 ```
 
-### 5. Get your NVIDIA NIM API Key (Free)
+### 4. Get your NVIDIA NIM API Key (Free)
 
 1. Go to [build.nvidia.com](https://build.nvidia.com)
 2. Sign up for free — no credit card required
-3. Navigate to **API Catalog** → select any model → click **Get API Key**
-4. Copy the key into your `.env` file
+3. Navigate to **Models** → filter by **Free Endpoint** → select `mistral-large-3-675b-instruct-2512`
+4. Click **Get API Key** and copy it into your `.env` file
 
-### 6. Run the app
+### 5. Run the app
 
 ```bash
 streamlit run app.py
@@ -92,13 +89,11 @@ streamlit run app.py
 
 ## 🧠 Model Used
 
-| Model | Provider | Type | Size |
-|-------|----------|------|------|
-| `nvidia/llama-3.1-nemotron-nano-8b-healthcare-text2sql-v1.0` | NVIDIA NIM | Text-to-SQL (fine-tuned) | 8B |
+| Model | Provider | Endpoint | Size |
+|-------|----------|----------|------|
+| `mistralai/mistral-large-3-675b-instruct-2512` | Mistral AI via NVIDIA NIM | ✅ Free API | 675B |
 
-This model is **fine-tuned specifically for Text-to-SQL** tasks. It accepts your table DDL as context and returns only the SQL query — fast, deterministic, and efficient.
-
-> 🔁 You can swap to `mistralai/mistral-large-2-instruct` or `qwen/qwen3-coder-480b-a22b-instruct` for more complex multi-join queries by changing the `model` field in `chain.py`.
+Mistral Large 3 is a **state-of-the-art instruction-following model** with strong SQL generation, complex reasoning, and structured output capabilities — available as a free hosted endpoint on NVIDIA NIM.
 
 ---
 
@@ -111,7 +106,7 @@ LangChain SQL Agent
         ↓
 Schema DDL injected into prompt
         ↓
-NVIDIA NIM API (Text-to-SQL model)
+NVIDIA NIM API (Mistral Large 3 — 675B)
         ↓
 SQL Query generated
         ↓
@@ -128,7 +123,7 @@ Result displayed in Streamlit UI
 |-------|-----------|
 | UI | Streamlit |
 | LLM Orchestration | LangChain |
-| LLM API | NVIDIA NIM (Free Tier) |
+| LLM API | NVIDIA NIM — Mistral Large 3 (Free Tier) |
 | Database | PostgreSQL |
 | ORM / DB Connector | SQLAlchemy + psycopg2 |
 | Config | python-dotenv |
@@ -137,7 +132,7 @@ Result displayed in Streamlit UI
 
 ## 🔒 Security Notes
 
-- Never commit your `.env` file — it's listed in `.gitignore`
+- Never commit your `.env` file — it is listed in `.gitignore`
 - Use a **read-only** PostgreSQL user for safety
 - Restrict `SQLDatabase.from_uri()` to specific tables using `include_tables=[...]` to limit schema exposure
 
@@ -157,8 +152,8 @@ Result displayed in Streamlit UI
 
 **Change the model** — in `chain.py`:
 ```python
-model="mistralai/mistral-large-2-instruct"  # for complex reasoning
-model="qwen/qwen3-coder-480b-a22b-instruct" # for code-heavy SQL
+model="meta/llama-4-maverick-17b-128e-instruct"  # lighter, faster
+model="google/gemma-3-27b-it"                    # multimodal support
 ```
 
 **Restrict tables** — in `db.py`:
@@ -177,5 +172,6 @@ MIT License — free to use, modify, and distribute.
 ## 🙌 Acknowledgements
 
 - [NVIDIA NIM](https://build.nvidia.com) — Free LLM inference API
+- [Mistral AI](https://mistral.ai) — Mistral Large 3 model
 - [LangChain](https://python.langchain.com) — LLM orchestration framework
 - [Streamlit](https://streamlit.io) — UI framework
