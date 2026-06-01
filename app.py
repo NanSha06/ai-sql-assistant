@@ -18,24 +18,15 @@ st.markdown("""
 <style>
     @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Syne:wght@400;600;700;800&display=swap');
 
-    /* Base */
-    html, body, [class*="css"] {
-        font-family: 'Syne', sans-serif;
-    }
+    html, body, [class*="css"] { font-family: 'Syne', sans-serif; }
 
-    /* Background */
-    .stApp {
-        background-color: #0d0f14;
-        color: #e2e8f0;
-    }
+    .stApp { background-color: #0d0f14; color: #e2e8f0; }
 
-    /* Sidebar */
     [data-testid="stSidebar"] {
         background-color: #111318;
         border-right: 1px solid #1e2130;
     }
 
-    /* Header */
     .app-header {
         padding: 2rem 0 1.5rem 0;
         border-bottom: 1px solid #1e2130;
@@ -58,7 +49,6 @@ st.markdown("""
         font-family: 'JetBrains Mono', monospace;
     }
 
-    /* Input area */
     .stTextArea textarea {
         background-color: #111318 !important;
         border: 1px solid #1e2130 !important;
@@ -73,7 +63,6 @@ st.markdown("""
         box-shadow: 0 0 0 2px rgba(110, 231, 247, 0.1) !important;
     }
 
-    /* Buttons */
     .stButton > button {
         background: linear-gradient(135deg, #6ee7f7, #a78bfa);
         color: #0d0f14;
@@ -87,11 +76,8 @@ st.markdown("""
         transition: opacity 0.2s ease;
         width: 100%;
     }
-    .stButton > button:hover {
-        opacity: 0.88;
-    }
+    .stButton > button:hover { opacity: 0.88; }
 
-    /* Result cards */
     .result-card {
         background-color: #111318;
         border: 1px solid #1e2130;
@@ -132,8 +118,6 @@ st.markdown("""
         white-space: pre-wrap;
         word-break: break-word;
     }
-
-    /* History items */
     .history-item {
         background-color: #111318;
         border: 1px solid #1e2130;
@@ -145,12 +129,8 @@ st.markdown("""
         color: #94a3b8;
         transition: border-color 0.2s;
     }
-    .history-item:hover {
-        border-color: #6ee7f7;
-        color: #e2e8f0;
-    }
+    .history-item:hover { border-color: #6ee7f7; color: #e2e8f0; }
 
-    /* Status badges */
     .badge-success {
         display: inline-block;
         background: rgba(110, 231, 247, 0.1);
@@ -173,13 +153,31 @@ st.markdown("""
         font-family: 'JetBrains Mono', monospace;
         font-weight: 600;
     }
-
-    /* Divider */
-    hr {
-        border-color: #1e2130;
+    .badge-lang {
+        display: inline-block;
+        background: rgba(167, 139, 250, 0.1);
+        color: #a78bfa;
+        border: 1px solid rgba(167, 139, 250, 0.2);
+        border-radius: 20px;
+        padding: 0.2rem 0.8rem;
+        font-size: 0.75rem;
+        font-family: 'JetBrains Mono', monospace;
+        font-weight: 600;
+    }
+    .badge-rag {
+        display: inline-block;
+        background: rgba(110, 231, 247, 0.07);
+        color: #6ee7f7;
+        border: 1px solid rgba(110, 231, 247, 0.15);
+        border-radius: 20px;
+        padding: 0.2rem 0.8rem;
+        font-size: 0.75rem;
+        font-family: 'JetBrains Mono', monospace;
+        font-weight: 600;
     }
 
-    /* Sidebar labels */
+    hr { border-color: #1e2130; }
+
     .sidebar-label {
         font-family: 'JetBrains Mono', monospace;
         font-size: 0.7rem;
@@ -189,14 +187,8 @@ st.markdown("""
         font-weight: 600;
         margin-bottom: 0.5rem;
     }
+    .stCheckbox label { color: #94a3b8 !important; font-size: 0.88rem !important; }
 
-    /* Toggle */
-    .stCheckbox label {
-        color: #94a3b8 !important;
-        font-size: 0.88rem !important;
-    }
-
-    /* Hide Streamlit branding */
     #MainMenu {visibility: hidden;}
     footer {visibility: hidden;}
     header {visibility: hidden;}
@@ -219,7 +211,6 @@ if "current_result" not in st.session_state:
 with st.sidebar:
     st.markdown('<p class="sidebar-label">Connection</p>', unsafe_allow_html=True)
 
-    # DB Connection button
     if not st.session_state.db_connected:
         if st.button("🔌 Connect to Database"):
             with st.spinner("Connecting..."):
@@ -234,7 +225,6 @@ with st.sidebar:
         st.markdown('<span class="badge-success">● Connected</span>', unsafe_allow_html=True)
         st.markdown("")
 
-        # Show available tables
         try:
             tables = st.session_state.db.get_usable_table_names()
             if tables:
@@ -246,7 +236,6 @@ with st.sidebar:
         except Exception:
             pass
 
-        # Disconnect
         st.markdown("---")
         if st.button("🔌 Disconnect"):
             st.session_state.db = None
@@ -269,9 +258,11 @@ with st.sidebar:
     # History
     if st.session_state.history:
         st.markdown('<p class="sidebar-label">History</p>', unsafe_allow_html=True)
-        for i, item in enumerate(reversed(st.session_state.history[-8:])):
+        for item in reversed(st.session_state.history[-8:]):
             truncated = item["question"][:45] + "..." if len(item["question"]) > 45 else item["question"]
-            st.markdown(f'<div class="history-item">↗ {truncated}</div>', unsafe_allow_html=True)
+            lang = item.get("language", "")
+            lang_tag = f" · {lang}" if lang and lang != "English" else ""
+            st.markdown(f'<div class="history-item">↗ {truncated}{lang_tag}</div>', unsafe_allow_html=True)
 
         if st.button("🗑 Clear History"):
             st.session_state.history = []
@@ -279,18 +270,21 @@ with st.sidebar:
             st.rerun()
 
     st.markdown("---")
-    st.markdown('<p style="font-size:0.75rem;color:#334155;font-family:JetBrains Mono,monospace;">Mistral Large 3 · 675B<br>NVIDIA NIM Free Tier</p>', unsafe_allow_html=True)
+    st.markdown(
+        '<p style="font-size:0.75rem;color:#334155;font-family:JetBrains Mono,monospace;">'
+        'Mistral Large 3 · 675B<br>NVIDIA NIM · RAG Enhanced</p>',
+        unsafe_allow_html=True
+    )
 
 
 # ── Main Area ──────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="app-header">
     <h1 class="app-title">AI SQL Assistant</h1>
-    <p class="app-subtitle">natural language → postgresql · powered by mistral large 3</p>
+    <p class="app-subtitle">natural language → postgresql · multilingual rag · mistral large 3</p>
 </div>
 """, unsafe_allow_html=True)
 
-# Connection gate
 if not st.session_state.db_connected:
     st.info("👈 Connect to your database using the sidebar to get started.")
     st.stop()
@@ -298,7 +292,7 @@ if not st.session_state.db_connected:
 # Question input
 question = st.text_area(
     "Ask a question about your data",
-    placeholder="e.g. How many users signed up last month? · Show the top 5 products by revenue",
+    placeholder="e.g. Show top 10 customers by revenue · राजस्व के अनुसार शीर्ष ग्राहक",
     height=100,
     label_visibility="collapsed"
 )
@@ -323,7 +317,7 @@ if run_btn:
                 output = ask(
                     question=question.strip(),
                     db=st.session_state.db,
-                    use_few_shot=use_few_shot
+                    use_few_shot=use_few_shot,
                 )
                 st.session_state.current_result = output
                 st.session_state.history.append(output)
@@ -336,7 +330,21 @@ if st.session_state.current_result:
 
     st.markdown("---")
 
-    # SQL block
+    # ── Meta badges — language + RAG chunks ───────────────────────────────────
+    lang       = output.get("language", "English")
+    rag_chunks = output.get("rag_chunks", 0)
+
+    meta_html = ""
+    if lang and lang != "English":
+        meta_html += f'<span class="badge-lang">🌐 {lang}</span>&nbsp;'
+    if rag_chunks:
+        meta_html += f'<span class="badge-rag">📚 {rag_chunks} context chunk{"s" if rag_chunks != 1 else ""}</span>'
+
+    if meta_html:
+        st.markdown(meta_html, unsafe_allow_html=True)
+        st.markdown("")
+
+    # ── SQL block ──────────────────────────────────────────────────────────────
     if show_sql or output["sql"] == "None":
         st.markdown(f"""
         <div class="result-card">
@@ -345,8 +353,8 @@ if st.session_state.current_result:
         </div>
         """, unsafe_allow_html=True)
 
-    # Result block
-    is_error = output["result"].startswith("❌")
+    # ── Result block ───────────────────────────────────────────────────────────
+    is_error = output["result"].startswith("❌") or output["result"].startswith("🚫")
     st.markdown(f"""
     <div class="result-card">
         <div class="result-card-label">Result &nbsp;
