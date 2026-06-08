@@ -1,2 +1,10 @@
-invalid type: string "# Table: block_21\nColumns: \n\n/*\n3 rows from products table:\nid\tname\tcategory\tprice\tstock_qty\tcreated_at\n1\tWireless Mouse\tElectronics\t29.99\t150\t2024-09-22 06:54:14.120099\n2\tMechanical Keyboard\tElectronics\t89.99\t80\t2024-06-08 15:02:14.120099\n3\tUSB-C Hub\tElectronics\t49.99\t200\t2026-05-02 04:16:14.120099\n*/", expected i64ubman Gill	Ashish Nehra	2
-*/t8ÿ
+# Table: block_15
+Columns: 
+
+/*
+3 rows from ipl_teams table:
+id	short_name	full_name	home_city	home_ground	captain	coach	titles_won
+1	RCB	Royal Challengers Bengaluru	Bengaluru	M. Chinnaswamy Stadium	Rajat Patidar	Andy Flower	1
+2	PBKS	Punjab Kings	Mohali	New PCA Stadium, New Chandigarh	Shreyas Iyer	Ricky Ponting	0
+3	GT	Gujarat Titans	Ahmedabad	Narendra Modi Stadium	Shubman Gill	Ashish Nehra	2
+*/ole

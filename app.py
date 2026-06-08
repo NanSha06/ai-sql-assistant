@@ -387,7 +387,7 @@ with st.sidebar:
 st.markdown("""
 <div class="app-header">
     <h1 class="app-title">AI SQL Assistant</h1>
-    <p class="app-subtitle">natural language → postgresql · powered by mistral large 3</p>
+    <p class="app-subtitle">natural language → postgresql · powered by qwen3 coder  </p>
 </div>
 """, unsafe_allow_html=True)
 
