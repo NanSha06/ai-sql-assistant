@@ -1,39 +1,42 @@
 import os
 import warnings
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
 
-# Suppress langchain-community deprecation warning (no standalone replacement yet for SQLDatabase)
 warnings.filterwarnings("ignore", category=DeprecationWarning, module="langchain_community")
 
 from langchain_community.utilities import SQLDatabase
+from sqlalchemy.engine import URL
 
-# Load environment variables from .env file
 load_dotenv()
 
 
 def get_db_url() -> str:
-    """Build PostgreSQL connection URL from environment variables."""
-    host = os.getenv("DB_HOST")
-    port = os.getenv("DB_PORT")
-    name = os.getenv("DB_NAME")
-    user = os.getenv("DB_USER")
-    password = os.getenv("DB_PASS")
+    """
+    Build a PostgreSQL connection URL from environment variables.
+    Uses SQLAlchemy URL.create() so special characters in passwords
+    (e.g. @, :, /, #, spaces) are safely percent-encoded and never
+    break URL parsing.
+    """
+    host     = os.getenv("DB_HOST")
+    port     = os.getenv("DB_PORT", "5432")
+    name     = os.getenv("DB_NAME")
+    user     = os.getenv("DB_USER")
+    password = os.getenv("DB_PASS", "")
 
-    # Check all required env variables are present
-    missing = [
-        var for var, val in {
-            "DB_HOST": host,
-            "DB_PORT": port,
-            "DB_NAME": name,
-            "DB_USER": user,
-            "DB_PASS": password
-        }.items() if not val
-    ]
-
+    missing = [k for k, v in {"DB_HOST": host, "DB_NAME": name, "DB_USER": user}.items() if not v]
     if missing:
         raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
-    return f"postgresql+psycopg2://{user}:{password}@{host}:{port}/{name}"
+    url = URL.create(
+        drivername="postgresql+psycopg2",
+        username=user,
+        password=password,   # SQLAlchemy handles encoding internally
+        host=host,
+        port=int(port),
+        database=name,
+    )
+    return url.render_as_string(hide_password=False)
 
 
 def get_db(include_tables: list = None) -> SQLDatabase:
@@ -42,42 +45,26 @@ def get_db(include_tables: list = None) -> SQLDatabase:
 
     Args:
         include_tables: Optional list of table names to expose to the agent.
-                        If None, all tables are included.
-                        Example: ["users", "orders", "products"]
 
     Returns:
-        SQLDatabase instance ready for use with LangChain SQL Agent.
+        SQLDatabase instance.
     """
     db_url = get_db_url()
 
     try:
-        if include_tables:
-            db = SQLDatabase.from_uri(
-                db_url,
-                include_tables=include_tables
-            )
-        else:
-            db = SQLDatabase.from_uri(db_url)
-
-        print(f"✅ Connected to database successfully.")
-        print(f"📋 Available tables: {db.get_usable_table_names()}")
+        db = SQLDatabase.from_uri(
+            db_url,
+            include_tables=include_tables if include_tables else None,
+        )
+        print("[SUCCESS] Connected to database successfully.")
+        print(f"[INFO] Available tables: {db.get_usable_table_names()}")
         return db
-
     except Exception as e:
         raise ConnectionError(f"❌ Failed to connect to the database: {e}")
 
 
 def get_schema(db: SQLDatabase) -> str:
-    """
-    Extract and return the DDL schema from the database.
-    Used to inject table definitions into the prompt.
-
-    Args:
-        db: SQLDatabase instance
-
-    Returns:
-        Schema string with table definitions
-    """
+    """Extract and return the DDL schema from the database."""
     return db.get_table_info()
 
 
