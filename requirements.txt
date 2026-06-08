@@ -2,10 +2,11 @@
 streamlit>=1.35.0
 langchain>=0.2.0
 langchain-community>=0.2.0
-langchain-openai>=0.1.0          # used for NVIDIA NIM OpenAI-compatible endpoint
+langchain-openai>=0.1.0
 
 # ─── LLM & Embedding API ──────────────────────────────────────────────────────
-openai>=1.30.0                   # NVIDIA NIM uses the OpenAI-compatible API
+openai>=1.30.0
+langchain-nvidia-ai-endpoints>=0.3.0   # NVIDIAEmbeddings for BGE-M3
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 psycopg2-binary>=2.9.9
@@ -14,13 +15,14 @@ sqlalchemy>=2.0.0
 # ─── RAG — Vector store ───────────────────────────────────────────────────────
 chromadb>=0.5.0
 
-# ─── RAG — Embeddings ─────────────────────────────────────────────────────────
-sentence-transformers>=3.0.0     # local fallback; primary embeddings via NVIDIA NIM
+# ─── RAG — Embeddings (NVIDIA NIM — no local PyTorch required) ───────────────
+# sentence-transformers and langchain-huggingface intentionally omitted.
+# Embeddings are served via NVIDIA NIM using your existing NVIDIA_API_KEY.
 
 # ─── RAG — Language detection ─────────────────────────────────────────────────
 langdetect>=1.0.9
 
-# ─── Visualisation (Phase 6 analytics layer) ──────────────────────────────────
+# ─── Visualisation ────────────────────────────────────────────────────────────
 plotly>=5.22.0
 altair>=5.3.0
 
@@ -28,5 +30,5 @@ altair>=5.3.0
 python-dotenv>=1.0.0
 
 # ─── Utilities ────────────────────────────────────────────────────────────────
-tiktoken>=0.7.0                  # token counting for chunk size estimation
-pandas>=2.2.0                    # result DataFrames & chart data prep
+tiktoken>=0.7.0
+pandas>=2.2.0

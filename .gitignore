@@ -29,7 +29,16 @@ test_nim.py
 .pytest_cache/
 .coverage
 htmlcov/
-
+test_chain.py
+test_models.py
+test_requests.py
+test_embed.py
+test_llm.py
+test_no_emoji.py
+time_req.py
+test_nvidia.py
+test_nvidia_ps.py
+test_langchain.py
 # ========================
 # Streamlit
 # ========================

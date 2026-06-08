@@ -1,224 +1,148 @@
 """
 rag/embeddings.py
------------------
-Multilingual embedding wrapper using NVIDIA NIM's NVIDIAEmbeddings
-via langchain_nvidia_ai_endpoints.
+─────────────────
+Embedding provider for the RAG layer.
 
-Model: nvidia/llama-nemotron-embed-1b-v2
-- Multilingual & cross-lingual retrieval
-- Long context support
-- Free tier on NVIDIA NIM
+Calls NVIDIA NIM embeddings directly via the OpenAI-compatible REST API
+using the `openai` package — zero PyTorch, zero DLL dependencies.
 
-Usage:
-    from rag.embeddings import get_embedder, embed_text, embed_batch
+The `openai` package is already in requirements.txt (used by langchain-openai).
 
-    embedder = get_embedder()
-    vector   = embed_text("show top customers by revenue")
-    vectors  = embed_batch(["question one", "question two"])
+Public API:
+    get_embedder()          -> Embeddings instance (cached)
+    embed_text(text)        -> List[float]
+    embed_batch(texts)      -> List[List[float]]
+
+Environment variables:
+    NVIDIA_API_KEY  — same key used for the LLM
 """
 
 import os
 import time
 import logging
-from typing import Optional
+from typing import List
 
 from dotenv import load_dotenv
-from langchain_nvidia_ai_endpoints import NVIDIAEmbeddings
-
 load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+NVIDIA_EMBED_MODEL  = "nvidia/nv-embedqa-e5-v5"
+NVIDIA_BASE_URL     = "https://integrate.api.nvidia.com/v1"
+EMBED_DIM           = 1024
+EMBED_TIMEOUT_SEC   = 15   # hard cap — fail fast if NIM is slow
 
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nvidia/llama-nemotron-embed-1b-v2")
-EMBED_API_KEY   = os.getenv("NVIDIA_EMBED_API_KEY") or os.getenv("NVIDIA_API_KEY")
-
-# Retry settings for transient API errors
-MAX_RETRIES     = 3
-RETRY_DELAY_SEC = 2
+_embedder = None
 
 
-# ── Client factory ─────────────────────────────────────────────────────────────
+def get_embedder():
+    """Return a cached embedder instance. No PyTorch required."""
+    global _embedder
+    if _embedder is not None:
+        return _embedder
 
-def get_embedder(model: Optional[str] = None) -> NVIDIAEmbeddings:
+    api_key = os.getenv("NVIDIA_API_KEY")
+
+    if api_key:
+        _embedder = _NIMEmbedder(api_key)
+        logger.info("[embeddings] NVIDIA NIM embeddings ready (%s, %d-dim, timeout=%ds).",
+                    NVIDIA_EMBED_MODEL, EMBED_DIM, EMBED_TIMEOUT_SEC)
+    else:
+        logger.warning(
+            "[embeddings] NVIDIA_API_KEY not set. "
+            "RAG will use fallback embedder — set the key for real semantic search."
+        )
+        _embedder = _FallbackEmbedder()
+
+    return _embedder
+
+
+def embed_text(text: str) -> List[float]:
+    """Embed a single string and return its vector."""
+    return get_embedder().embed_query(text)
+
+
+def embed_batch(texts: List[str]) -> List[List[float]]:
+    """Embed a list of strings and return their vectors."""
+    if not texts:
+        return []
+    return get_embedder().embed_documents(texts)
+
+
+# ── Provider: NVIDIA NIM via openai REST client (no PyTorch) ─────────────────
+
+class _NIMEmbedder:
     """
-    Create and return an NVIDIAEmbeddings client.
+    Calls NVIDIA NIM /v1/embeddings directly with the `openai` package.
+    No langchain-nvidia-ai-endpoints, no torch, no DLLs.
 
-    Returns:
-        NVIDIAEmbeddings instance ready for query/passage embedding.
-
-    Raises:
-        ValueError: If NVIDIA_API_KEY / NVIDIA_EMBED_API_KEY is missing.
+    timeout is set at the httpx transport level so the request is
+    hard-killed after EMBED_TIMEOUT_SEC seconds — no more hangs.
     """
-    if not EMBED_API_KEY:
-        raise ValueError(
-            "❌ No embedding API key found. "
-            "Set NVIDIA_EMBED_API_KEY or NVIDIA_API_KEY in your .env file."
+
+    def __init__(self, api_key: str):
+        from openai import OpenAI          # already in requirements.txt
+        self._client = OpenAI(
+            api_key=api_key,
+            base_url=NVIDIA_BASE_URL,
+            timeout=EMBED_TIMEOUT_SEC,     # ← hard timeout (connect + read)
         )
 
-    return NVIDIAEmbeddings(
-        model=model or EMBEDDING_MODEL,
-        api_key=EMBED_API_KEY,
-        truncate="END",   # silently truncate inputs that exceed model max
-    )
+    def embed_query(self, text: str) -> List[float]:
+        return self._call([text])[0]
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        # NIM accepts up to 96 inputs per call — batch safely
+        results = []
+        batch_size = 32
+        for i in range(0, len(texts), batch_size):
+            results.extend(self._call(texts[i : i + batch_size]))
+        return results
+
+    def _call(self, texts: List[str]) -> List[List[float]]:
+        # Replace empty strings — NIM rejects them
+        texts = [t if t and t.strip() else "." for t in texts]
+
+        t0 = time.perf_counter()
+        logger.debug("[embeddings] NIM request start (%d texts, model=%s)",
+                     len(texts), NVIDIA_EMBED_MODEL)
+
+        response = self._client.embeddings.create(
+            model=NVIDIA_EMBED_MODEL,
+            input=texts,
+            encoding_format="float",
+            extra_body={"input_type": "query", "truncate": "END"},
+        )
+
+        elapsed = time.perf_counter() - t0
+        logger.debug("[embeddings] NIM request end (%.2fs)", elapsed)
+
+        # Sort by index to preserve order
+        items = sorted(response.data, key=lambda x: x.index)
+        return [item.embedding for item in items]
 
 
-# ── Single text embedding (query) ─────────────────────────────────────────────
+# ── Fallback: deterministic hash embedder (stdlib only) ──────────────────────
 
-def embed_text(
-    text: str,
-    embedder: Optional[NVIDIAEmbeddings] = None,
-) -> list[float]:
+class _FallbackEmbedder:
     """
-    Embed a single query string.
-
-    Uses embed_query() — the correct method for user questions at
-    retrieval time (as opposed to documents at indexing time).
-
-    Args:
-        text:     Input query string (any supported language).
-        embedder: Optional pre-built NVIDIAEmbeddings instance.
-
-    Returns:
-        List of floats representing the embedding vector.
-
-    Raises:
-        ValueError:   On empty input.
-        RuntimeError: If all retries are exhausted.
+    Zero-dependency fallback when no API key is set.
+    Keeps ChromaDB happy so the app starts — retrieval quality is meaningless.
     """
-    if not text or not text.strip():
-        raise ValueError("❌ embed_text received an empty string.")
+    DIM = EMBED_DIM
 
-    embedder   = embedder or get_embedder()
-    last_error: Exception = RuntimeError("Unknown error")
+    def embed_query(self, text: str) -> List[float]:
+        return self._hash_embed(text)
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            return embedder.embed_query(text)
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "embed_text attempt %d/%d failed: %s", attempt, MAX_RETRIES, exc
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SEC * attempt)
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [self._hash_embed(t) for t in texts]
 
-    raise RuntimeError(
-        f"❌ embed_text failed after {MAX_RETRIES} attempts. "
-        f"Last error: {last_error}"
-    )
-
-
-# ── Batch embedding (documents / passages) ────────────────────────────────────
-
-def embed_batch(
-    texts: list[str],
-    embedder: Optional[NVIDIAEmbeddings] = None,
-) -> list[list[float]]:
-    """
-    Embed a list of document/passage strings for indexing into ChromaDB.
-
-    Uses embed_documents() — the correct method for schema chunks,
-    business rules, and glossary entries at indexing time.
-
-    Args:
-        texts:    List of document strings to embed.
-        embedder: Optional pre-built NVIDIAEmbeddings instance.
-
-    Returns:
-        List of embedding vectors in the same order as input texts.
-
-    Raises:
-        ValueError:   If texts list is empty.
-        RuntimeError: If all retries are exhausted.
-    """
-    if not texts:
-        raise ValueError("❌ embed_batch received an empty list.")
-
-    embedder   = embedder or get_embedder()
-    clean      = [t for t in texts if t and t.strip()]
-    last_error: Exception = RuntimeError("Unknown error")
-
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            vectors = embedder.embed_documents(clean)
-            logger.debug("Embedded %d documents.", len(vectors))
-            return vectors
-        except Exception as exc:
-            last_error = exc
-            logger.warning(
-                "embed_batch attempt %d/%d failed: %s", attempt, MAX_RETRIES, exc
-            )
-            if attempt < MAX_RETRIES:
-                time.sleep(RETRY_DELAY_SEC * attempt)
-
-    raise RuntimeError(
-        f"❌ embed_batch failed after {MAX_RETRIES} attempts. "
-        f"Last error: {last_error}"
-    )
-
-
-# ── Health check ───────────────────────────────────────────────────────────────
-
-def check_embedding_health() -> bool:
-    """
-    Send a minimal test embedding to verify the NIM endpoint is
-    reachable and the API key is valid.
-
-    Returns:
-        True if the endpoint responds correctly, False otherwise.
-    """
-    try:
-        vector = embed_text("health check")
-        ok = isinstance(vector, list) and len(vector) > 0
-        if ok:
-            logger.info(
-                "✅ Embedding health check passed. Model: %s | Vector dim: %d",
-                EMBEDDING_MODEL, len(vector),
-            )
-        return ok
-    except Exception as exc:
-        logger.error("❌ Embedding health check failed: %s", exc)
-        return False
-
-
-# ── Quick test ─────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    print(f"Model   : {EMBEDDING_MODEL}\n")
-
-    # Test 1 — health check
-    print("── Health check ──────────────────────────────")
-    healthy = check_embedding_health()
-    print(f"Healthy : {healthy}\n")
-
-    if healthy:
-        # Test 2 — multilingual single embeddings
-        print("── Multilingual embed_query ──────────────────")
-        test_queries = [
-            ("English", "Show top 10 customers by revenue"),
-            ("Hindi",   "राजस्व के अनुसार शीर्ष 10 ग्राहक दिखाओ"),
-            ("French",  "Montrez les 10 meilleurs clients par revenus"),
-            ("Spanish", "Mostrar los 10 principales clientes por ingresos"),
-        ]
-
-        vectors = []
-        for lang, query in test_queries:
-            vec = embed_text(query)
-            vectors.append(vec)
-            print(f"  [{lang:8s}] dim={len(vec)} | first3={[round(v,4) for v in vec[:3]]}")
-
-        # Test 3 — batch embed_documents
-        print("\n── Batch embed_documents ─────────────────────")
-        docs = [
-            "Table: customers — stores customer name, email, created_at",
-            "Table: orders — stores order_id, customer_id, amount, status",
-            "Revenue: total value of completed orders",
-        ]
-        batch_vecs = embed_batch(docs)
-        print(f"  Docs     : {len(docs)}")
-        print(f"  Returned : {len(batch_vecs)} vectors")
-        print(f"  Dim match: {all(len(v) == len(vectors[0]) for v in batch_vecs)}")
+    def _hash_embed(self, text: str) -> List[float]:
+        import hashlib
+        seed = int(hashlib.md5(text.encode("utf-8", errors="replace")).hexdigest(), 16)
+        vec = []
+        for _ in range(self.DIM):
+            seed = (seed * 1664525 + 1013904223) & 0xFFFFFFFF
+            vec.append((seed / 0xFFFFFFFF) * 2 - 1)
+        norm = sum(x * x for x in vec) ** 0.5 or 1.0
+        return [x / norm for x in vec]

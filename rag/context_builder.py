@@ -11,14 +11,12 @@ Responsibilities:
 - Keep context within token budget
 
 Usage:
-    from rag.context_builder import build_context
-    from rag.retriever import retrieve_context
+    from rag.context_builder import get_rag_context
 
-    result  = retrieve_context("show top customers by revenue")
-    context = build_context(result)
-    # → inject context into prompts.py
+    context, retrieval = get_rag_context("show top customers by revenue")
 """
 
+import time
 import logging
 import os
 from typing import Optional
@@ -144,21 +142,34 @@ def get_rag_context(
     """
     One-call convenience: retrieve + build context.
 
-    This is what chain.py will call — single import, single call.
+    This is what chain.py calls — single import, single call.
 
         from rag.context_builder import get_rag_context
         context, retrieval = get_rag_context(question)
 
+    FAIL-FAST CONTRACT:
+    - The entire pipeline (embed + chroma + build) is wrapped in a
+      broad except. If anything fails — timeout, network error,
+      ChromaDB crash — we return ("", empty_retrieval) and SQL
+      generation proceeds without RAG context.
+    - Total wall-clock time is logged so hangs are immediately visible.
+
     Args:
         query:        User question (any language).
         collection:   Optional pre-built ChromaDB collection.
-        embedder:     Optional pre-built NVIDIAEmbeddings instance.
+        embedder:     Optional pre-built embedder instance.
         **build_kwargs: Passed to build_context().
 
     Returns:
         Tuple of (context_string, RetrievalResult).
-        context_string is empty if vector store is empty.
+        context_string is "" on any failure.
     """
+    t0 = time.perf_counter()
+    logger.info("[context_builder] get_rag_context START for: %.60s", query)
+
+    # Build an empty fallback so we always have something to return
+    empty_result = RetrievalResult(query=query)
+
     try:
         retrieval = retrieve_context(
             query,
@@ -166,12 +177,21 @@ def get_rag_context(
             embedder=embedder,
         )
         context = build_context(retrieval, **build_kwargs)
+
+        elapsed = time.perf_counter() - t0
+        logger.info("[context_builder] get_rag_context END (%.2fs, %d chunks)",
+                    elapsed, retrieval.total)
+
         return context, retrieval
 
-    except RuntimeError as exc:
-        # Vector store empty — degrade gracefully, don't crash chain.py
-        logger.warning("RAG unavailable: %s. Proceeding without context.", exc)
-        return "", None
+    except Exception as exc:
+        # ── FAIL-FAST: catch absolutely everything ────────────────────
+        elapsed = time.perf_counter() - t0
+        logger.warning(
+            "[context_builder] RAG pipeline failed after %.2fs: %s. "
+            "Proceeding without context.", elapsed, exc,
+        )
+        return "", empty_result
 
 
 # ── Quick test ─────────────────────────────────────────────────────────────────
@@ -194,9 +214,9 @@ if __name__ == "__main__":
 
         if context:
             print(context)
-            print(f"\n── Stats ──")
+            print(f"\n-- Stats --")
             print(f"  Chars    : {len(context)}")
             print(f"  Chunks   : {retrieval.total}")
             print(f"  Language : {retrieval.language.language_name}")
         else:
-            print("⚠️  No context retrieved (vector store may be empty).")
+            print("No context retrieved (vector store may be empty or API timed out).")

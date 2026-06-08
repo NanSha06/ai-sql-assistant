@@ -1,338 +1,231 @@
 """
 rag/indexing.py
----------------
-Indexes knowledge/ directory files into ChromaDB.
+───────────────
+Builds (or refreshes) the ChromaDB vector index from two sources:
 
-Reads markdown/text files from:
-    knowledge/schema_docs/      ← table & column descriptions
-    knowledge/business_rules/   ← business logic
-    knowledge/glossary/         ← term definitions
-    knowledge/kpi_definitions/  ← KPI docs
+  1. Live PostgreSQL schema  — extracted via db.get_schema() and split
+     per-table so each table is a focused, independently-retrievable chunk.
 
-Chunks each file, embeds via NVIDIA NIM, and upserts into ChromaDB.
-Safe to re-run — upsert prevents duplicates.
+  2. knowledge/ directory   — Markdown files under schema_docs/, glossary/,
+     kpi_definitions/, and business_rules/ are read and indexed with their
+     source type recorded in metadata.
 
-Usage:
-    # Index everything
-    python -m rag.indexing
+Run once after setup, then re-run whenever the schema or knowledge files change:
 
-    # Index a specific source type only
-    python -m rag.indexing --source schema
-    python -m rag.indexing --source glossary
-    python -m rag.indexing --source business_rules
-    python -m rag.indexing --source kpi
+    python -m rag.indexing           # indexes everything
+    python -m rag.indexing --schema  # schema only
+    python -m rag.indexing --docs    # knowledge/ docs only
+    python -m rag.indexing --reset   # wipe and re-index everything
 
-    # Wipe and re-index from scratch
-    python -m rag.indexing --reset
+Public API used by app.py (index-on-connect feature):
+    index_schema(db)
+    index_knowledge_docs()
+    is_index_empty() -> bool
 """
 
 import os
 import re
+import hashlib
 import logging
 import argparse
-import hashlib
 from pathlib import Path
-from typing import Optional
-
-from dotenv import load_dotenv
-
-from rag.embeddings import get_embedder
-from rag.vector_store import get_chroma_client, get_vector_store, add_documents, reset_collection
-
-load_dotenv()
+from typing import List, Tuple
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
+KNOWLEDGE_DIR = Path(__file__).parent.parent / "knowledge"
 
-CHUNK_SIZE    = int(os.getenv("CHUNK_SIZE",   "400"))   # target tokens per chunk
-CHUNK_OVERLAP = int(os.getenv("CHUNK_OVERLAP", "50"))   # overlap between chunks
-
-# Map source_type → knowledge/ subdirectory
-SOURCE_PATHS: dict[str, str] = {
-    "schema":         os.getenv("SCHEMA_DOCS_PATH",     "./knowledge/schema_docs"),
-    "business_rules": os.getenv("BUSINESS_RULES_PATH",  "./knowledge/business_rules"),
-    "glossary":       os.getenv("GLOSSARY_PATH",        "./knowledge/glossary"),
-    "kpi":            os.getenv("KPI_DEFINITIONS_PATH", "./knowledge/kpi_definitions"),
+SOURCE_TYPE_MAP = {
+    "schema_docs":      "schema",
+    "glossary":         "glossary",
+    "kpi_definitions":  "kpi",
+    "business_rules":   "business_rule",
 }
 
-# File extensions to index
-SUPPORTED_EXTENSIONS = {".md", ".txt"}
+
+# ── Public API ────────────────────────────────────────────────────────────────
+
+def is_index_empty() -> bool:
+    """Return True if the ChromaDB collection has no documents."""
+    try:
+        from rag.vector_store import get_collection   # noqa: PLC0415
+        col = get_collection()
+        return col is None or col.count() == 0
+    except Exception:
+        return True
 
 
-# ── Text chunking ──────────────────────────────────────────────────────────────
-
-def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, overlap: int = CHUNK_OVERLAP) -> list[str]:
+def index_schema(db) -> int:
     """
-    Split text into overlapping chunks by word count.
-
-    Tries to split on paragraph boundaries first (double newline),
-    then falls back to word-level sliding window.
-
-    Args:
-        text:       Input text to split.
-        chunk_size: Target words per chunk.
-        overlap:    Words to repeat at the start of each new chunk.
-
-    Returns:
-        List of text chunks.
-    """
-    # Normalize whitespace
-    text = re.sub(r"\n{3,}", "\n\n", text.strip())
-
-    # Try paragraph-based splitting first
-    paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
-
-    chunks: list[str] = []
-    current_words: list[str] = []
-
-    for para in paragraphs:
-        para_words = para.split()
-
-        # If a single paragraph exceeds chunk_size, split it further
-        if len(para_words) > chunk_size:
-            # Flush current buffer first
-            if current_words:
-                chunks.append(" ".join(current_words))
-                current_words = current_words[-overlap:] if overlap else []
-
-            # Sliding window over long paragraph
-            for i in range(0, len(para_words), chunk_size - overlap):
-                window = para_words[i : i + chunk_size]
-                if window:
-                    chunks.append(" ".join(window))
-            current_words = para_words[-(overlap):] if overlap else []
-            continue
-
-        # Would adding this paragraph exceed chunk_size?
-        if len(current_words) + len(para_words) > chunk_size:
-            if current_words:
-                chunks.append(" ".join(current_words))
-                current_words = current_words[-overlap:] if overlap else []
-
-        current_words.extend(para_words)
-
-    # Flush remaining words
-    if current_words:
-        chunks.append(" ".join(current_words))
-
-    return [c for c in chunks if c.strip()]
-
-
-# ── ID generation ──────────────────────────────────────────────────────────────
-
-def make_chunk_id(source_type: str, filename: str, chunk_index: int) -> str:
-    """
-    Generate a stable, unique ID for a document chunk.
-
-    Uses source_type + filename + chunk index so re-indexing the same
-    file always produces the same IDs → upsert deduplicates cleanly.
-
-    Returns:
-        String ID like "schema__customers__0"
-    """
-    stem = Path(filename).stem
-    # Sanitize for ChromaDB (alphanumeric + underscores only)
-    stem = re.sub(r"[^a-zA-Z0-9_-]", "_", stem)
-    return f"{source_type}__{stem}__{chunk_index}"
-
-
-# ── Single file indexer ────────────────────────────────────────────────────────
-
-def index_file(
-    filepath: Path,
-    source_type: str,
-    collection,
-    embedder,
-) -> int:
-    """
-    Read, chunk, and index a single file into ChromaDB.
-
-    Args:
-        filepath:    Path to the file.
-        source_type: Category label (schema, glossary, kpi, business_rules).
-        collection:  ChromaDB collection.
-        embedder:    NVIDIAEmbeddings instance.
-
-    Returns:
-        Number of chunks indexed from this file.
+    Extract per-table DDL from a connected SQLDatabase and upsert into ChromaDB.
+    Returns the number of chunks indexed (0 on failure).
     """
     try:
-        text = filepath.read_text(encoding="utf-8").strip()
+        from db import get_schema                     # noqa: PLC0415
+        from rag.embeddings import embed_batch        # noqa: PLC0415
+        from rag.vector_store import add_chunks       # noqa: PLC0415
+    except ImportError as exc:
+        logger.error("Missing dependency for index_schema: %s", exc)
+        return 0
+
+    try:
+        full_schema = get_schema(db)
+        table_chunks = _split_schema_by_table(full_schema)
+
+        if not table_chunks:
+            logger.warning("No table chunks extracted from schema.")
+            return 0
+
+        chunks, ids, metas = [], [], []
+        for table_name, ddl in table_chunks:
+            doc = _format_schema_chunk(table_name, ddl)
+            chunk_id = f"schema__{table_name}__0"
+            fhash = hashlib.md5(doc.encode()).hexdigest()[:8]
+            chunks.append(doc)
+            ids.append(chunk_id)
+            metas.append({
+                "source_type": "schema",
+                "filename": f"{table_name}.md",
+                "table_name": table_name,
+                "file_hash": fhash,
+                "chunk_index": 0,
+                "total_chunks": 1,
+            })
+
+        embeddings = embed_batch(chunks)
+        ok = add_chunks(chunks, ids, metas, embeddings)
+        count = len(chunks) if ok else 0
+        logger.info("Schema indexing: %d table chunks upserted.", count)
+        return count
+
     except Exception as exc:
-        logger.error("❌ Could not read %s: %s", filepath, exc)
+        logger.error("index_schema failed: %s", exc)
         return 0
 
-    if not text:
-        logger.warning("⚠️  Skipping empty file: %s", filepath.name)
+
+def index_knowledge_docs() -> int:
+    """
+    Walk knowledge/ subdirectories and index all .md files.
+    Returns total chunks indexed.
+    """
+    try:
+        from rag.embeddings import embed_batch   # noqa: PLC0415
+        from rag.vector_store import add_chunks  # noqa: PLC0415
+    except ImportError as exc:
+        logger.error("Missing dependency for index_knowledge_docs: %s", exc)
         return 0
 
-    chunks = chunk_text(text)
-    if not chunks:
-        logger.warning("⚠️  No chunks produced from: %s", filepath.name)
-        return 0
+    total = 0
+    for subdir, source_type in SOURCE_TYPE_MAP.items():
+        folder = KNOWLEDGE_DIR / subdir
+        if not folder.exists():
+            continue
 
-    # Build metadata for each chunk
-    file_hash = hashlib.md5(text.encode()).hexdigest()[:8]
+        md_files = list(folder.glob("*.md"))
+        if not md_files:
+            continue
 
-    metadatas = [
-        {
-            "source_type": source_type,
-            "filename":    filepath.name,
-            "file_hash":   file_hash,
-            "chunk_index": i,
-            "total_chunks": len(chunks),
-        }
-        for i in range(len(chunks))
-    ]
+        chunks, ids, metas = [], [], []
+        for md_path in md_files:
+            text = md_path.read_text(encoding="utf-8").strip()
+            if not text:
+                continue
 
-    ids = [make_chunk_id(source_type, filepath.name, i) for i in range(len(chunks))]
+            fhash = hashlib.md5(text.encode()).hexdigest()[:8]
+            chunk_id = f"{source_type}__{md_path.stem}__0"
+            chunks.append(text)
+            ids.append(chunk_id)
+            metas.append({
+                "source_type": source_type,
+                "filename": md_path.name,
+                "file_hash": fhash,
+                "chunk_index": 0,
+                "total_chunks": 1,
+            })
 
-    add_documents(collection, texts=chunks, metadatas=metadatas, ids=ids, embedder=embedder)
+        if chunks:
+            embeddings = embed_batch(chunks)
+            ok = add_chunks(chunks, ids, metas, embeddings)
+            n = len(chunks) if ok else 0
+            logger.info("Indexed %d docs from knowledge/%s.", n, subdir)
+            total += n
 
-    logger.info(
-        "  ✅ %s → %d chunk(s) indexed. [%s]",
-        filepath.name, len(chunks), source_type,
+    return total
+
+
+# ── Schema splitting helpers ──────────────────────────────────────────────────
+
+def _split_schema_by_table(schema: str) -> List[Tuple[str, str]]:
+    """
+    Split a full DDL schema string into (table_name, ddl_block) pairs.
+    Handles both CREATE TABLE and plain column-list formats.
+    """
+    # Match CREATE TABLE blocks
+    pattern = re.compile(
+        r"(CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?[`\"]?(\w+)[`\"]?\s*\(.*?\);)",
+        re.IGNORECASE | re.DOTALL,
     )
-    return len(chunks)
+    matches = pattern.findall(schema)
+    if matches:
+        return [(name, ddl) for ddl, name in matches]
+
+    # Fallback: split on blank lines and try to extract table names
+    blocks = [b.strip() for b in schema.split("\n\n") if b.strip()]
+    results = []
+    for block in blocks:
+        m = re.search(r"(?:TABLE|table)\s+[`\"]?(\w+)[`\"]?", block)
+        name = m.group(1) if m else f"block_{len(results)}"
+        results.append((name, block))
+    return results
 
 
-# ── Directory indexer ──────────────────────────────────────────────────────────
+def _format_schema_chunk(table_name: str, ddl: str) -> str:
+    """Format a schema chunk for embedding — clean and readable."""
+    # Extract column names from DDL for the summary line
+    col_matches = re.findall(r"^\s+[`\"]?(\w+)[`\"]?\s+\w+", ddl, re.MULTILINE)
+    cols = ", ".join(col_matches[:10])
+    suffix = ", …" if len(col_matches) > 10 else ""
 
-def index_directory(
-    source_type: str,
-    collection,
-    embedder,
-) -> dict:
-    """
-    Index all supported files from a knowledge/ subdirectory.
-
-    Args:
-        source_type: One of: schema, business_rules, glossary, kpi.
-        collection:  ChromaDB collection.
-        embedder:    NVIDIAEmbeddings instance.
-
-    Returns:
-        Dict with files_found, files_indexed, total_chunks.
-    """
-    directory = Path(SOURCE_PATHS[source_type])
-
-    if not directory.exists():
-        logger.warning("⚠️  Directory not found, skipping: %s", directory)
-        return {"files_found": 0, "files_indexed": 0, "total_chunks": 0}
-
-    files = [
-        f for f in sorted(directory.iterdir())
-        if f.is_file() and f.suffix.lower() in SUPPORTED_EXTENSIONS
-    ]
-
-    if not files:
-        logger.warning("⚠️  No .md or .txt files found in: %s", directory)
-        return {"files_found": 0, "files_indexed": 0, "total_chunks": 0}
-
-    logger.info("📂 Indexing [%s] from %s (%d file(s))", source_type, directory, len(files))
-
-    total_chunks   = 0
-    files_indexed  = 0
-
-    for filepath in files:
-        chunks = index_file(filepath, source_type, collection, embedder)
-        if chunks > 0:
-            total_chunks  += chunks
-            files_indexed += 1
-
-    return {
-        "files_found":   len(files),
-        "files_indexed": files_indexed,
-        "total_chunks":  total_chunks,
-    }
-
-
-# ── Main indexing entry point ──────────────────────────────────────────────────
-
-def run_indexing(
-    source_filter: Optional[str] = None,
-    reset: bool = False,
-) -> dict:
-    """
-    Index all (or one) knowledge source(s) into ChromaDB.
-
-    Args:
-        source_filter: Index only this source type (None = index all).
-        reset:         If True, wipe the collection before indexing.
-
-    Returns:
-        Summary dict with per-source and total stats.
-    """
-    client     = get_chroma_client()
-    embedder   = get_embedder()
-
-    if reset:
-        logger.warning("🗑️  --reset flag set. Wiping collection before indexing.")
-        reset_collection(client=client)
-
-    collection = get_vector_store(client=client)
-
-    sources = (
-        {source_filter: SOURCE_PATHS[source_filter]}
-        if source_filter
-        else SOURCE_PATHS
+    return (
+        f"# Table: {table_name}\n"
+        f"Columns: {cols}{suffix}\n\n"
+        f"{ddl.strip()}"
     )
 
-    summary = {}
-    grand_total_chunks = 0
 
-    for source_type in sources:
-        result = index_directory(source_type, collection, embedder)
-        summary[source_type] = result
-        grand_total_chunks  += result["total_chunks"]
-
-    summary["__total_chunks__"] = grand_total_chunks
-    summary["__collection_count__"] = collection.count()
-
-    return summary
-
-
-# ── CLI ────────────────────────────────────────────────────────────────────────
+# ── CLI entry point ───────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(levelname)s:%(name)s:%(message)s",
-    )
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
-    parser = argparse.ArgumentParser(description="Index knowledge/ docs into ChromaDB.")
-    parser.add_argument(
-        "--source",
-        choices=list(SOURCE_PATHS.keys()),
-        default=None,
-        help="Index only this source type (default: index all).",
-    )
-    parser.add_argument(
-        "--reset",
-        action="store_true",
-        help="Wipe the collection before indexing.",
-    )
+    parser = argparse.ArgumentParser(description="Index schema and/or knowledge docs into ChromaDB.")
+    parser.add_argument("--schema",  action="store_true", help="Index DB schema only")
+    parser.add_argument("--docs",    action="store_true", help="Index knowledge/ docs only")
+    parser.add_argument("--reset",   action="store_true", help="Wipe collection before indexing")
     args = parser.parse_args()
 
-    print("\n🔍 AI SQL Assistant — RAG Indexing")
-    print("=" * 45)
+    do_all = not (args.schema or args.docs)
 
     if args.reset:
-        print("⚠️  Reset flag set — collection will be wiped.\n")
+        from rag.vector_store import reset_collection
+        reset_collection()
 
-    summary = run_indexing(source_filter=args.source, reset=args.reset)
+    if do_all or args.schema:
+        try:
+            from db import get_db
+            db = get_db()
+            n = index_schema(db)
+            print(f"✅ Schema: {n} chunks indexed.")
+        except Exception as e:
+            print(f"❌ Schema indexing failed: {e}")
+            sys.exit(1)
 
-    print("\n── Indexing Summary ──────────────────────────")
-    for source, stats in summary.items():
-        if source.startswith("__"):
-            continue
-        print(
-            f"  {source:<18} "
-            f"files: {stats['files_indexed']}/{stats['files_found']}  "
-            f"chunks: {stats['total_chunks']}"
-        )
+    if do_all or args.docs:
+        n = index_knowledge_docs()
+        print(f"✅ Knowledge docs: {n} chunks indexed.")
 
-    print(f"\n  Total chunks indexed : {summary['__total_chunks__']}")
-    print(f"  Collection count     : {summary['__collection_count__']}")
-    print("\n✅ Indexing complete.\n")
+    # Summary
+    from rag.vector_store import get_collection
+    col = get_collection()
+    print(f"\n📦 Total documents in ChromaDB: {col.count() if col else 0}")

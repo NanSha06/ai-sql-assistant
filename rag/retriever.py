@@ -1,258 +1,185 @@
 """
 rag/retriever.py
-----------------
-Query-time retrieval layer.
+────────────────
+Retrieves relevant schema / glossary / KPI chunks from ChromaDB
+and returns a RetrievalResult object consumed by context_builder.py.
 
-Combines language detection + vector search to fetch the most
-relevant schema, glossary, business rules, and KPI chunks
-for a given user question (any language).
-
-This is the single entry point that chain.py will call:
-
-    from rag.retriever import retrieve_context
-    context = retrieve_context("show top customers by revenue")
-
-Usage:
-    python -m rag.retriever
+Public API:
+    retrieve_context(query, collection=None, embedder=None) -> RetrievalResult
+    RetrievalResult  — rich result object with .chunks, .total, .language,
+                       .by_source_type()
 """
 
+import time
 import logging
-import os
-from typing import Optional
-
-from dotenv import load_dotenv
-
-from rag.embeddings import get_embedder
-from rag.vector_store import get_chroma_client, get_vector_store, query_store
-from rag.language_detector import detect_language, DetectionResult
-
-load_dotenv()
+from typing import List, Optional
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
-# ── Constants ──────────────────────────────────────────────────────────────────
-
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
-
-# How many results to fetch per source_type when doing split retrieval.
-# Total results = SCHEMA_K + GLOSSARY_K + KPI_K + RULES_K
-SCHEMA_K  = int(os.getenv("SCHEMA_K",  "3"))
-GLOSSARY_K = int(os.getenv("GLOSSARY_K", "1"))
-KPI_K     = int(os.getenv("KPI_K",     "1"))
-RULES_K   = int(os.getenv("RULES_K",   "1"))
+TOP_K    = 5
+MIN_SCORE = 0.25   # minimum cosine similarity (0-1)
 
 
-# ── Result dataclass ───────────────────────────────────────────────────────────
+# ── Language result ───────────────────────────────────────────────────────────
 
+@dataclass
+class LanguageResult:
+    language: str       = "en"
+    language_name: str  = "English"
+    confidence: float   = 1.0
+
+
+def _detect_language(text: str) -> LanguageResult:
+    """Detect language of text. Falls back to English on any error."""
+    try:
+        from langdetect import detect, detect_langs   # noqa: PLC0415
+        lang = detect(text)
+        langs = detect_langs(text)
+        confidence = langs[0].prob if langs else 1.0
+        name = _LANG_NAMES.get(lang, lang.upper())
+        return LanguageResult(language=lang, language_name=name, confidence=confidence)
+    except Exception:
+        return LanguageResult()
+
+
+_LANG_NAMES = {
+    "en": "English", "hi": "Hindi",   "fr": "French",  "es": "Spanish",
+    "de": "German",  "zh": "Chinese", "ja": "Japanese","pt": "Portuguese",
+    "ar": "Arabic",  "ru": "Russian", "it": "Italian", "ko": "Korean",
+}
+
+
+# ── RetrievalResult ───────────────────────────────────────────────────────────
+
+@dataclass
 class RetrievalResult:
     """
-    Structured output from a retrieval call.
-
-    Attributes:
-        chunks:    List of retrieved document dicts (text, metadata, distance).
-        language:  DetectionResult from language_detector.
-        query:     Original user query.
-        total:     Total number of chunks retrieved.
+    Returned by retrieve_context().
+    Consumed by context_builder.build_context().
     """
-    def __init__(
-        self,
-        chunks: list[dict],
-        language: DetectionResult,
-        query: str,
-    ):
-        self.chunks   = chunks
-        self.language = language
-        self.query    = query
-        self.total    = len(chunks)
+    query:    str
+    chunks:   List[dict]          = field(default_factory=list)
+    language: LanguageResult      = field(default_factory=LanguageResult)
 
-    def by_source_type(self, source_type: str) -> list[dict]:
-        """Filter chunks by source_type metadata."""
-        return [c for c in self.chunks if c["metadata"].get("source_type") == source_type]
+    @property
+    def total(self) -> int:
+        return len(self.chunks)
 
-    def __repr__(self) -> str:
-        return (
-            f"RetrievalResult("
-            f"total={self.total}, "
-            f"language={self.language.language_name}, "
-            f"query='{self.query[:40]}...')"
-        )
+    def by_source_type(self, source_type: str) -> List[dict]:
+        """Return chunks filtered by source_type metadata."""
+        return [c for c in self.chunks if c.get("source_type") == source_type]
 
 
-# ── Core retrieval ─────────────────────────────────────────────────────────────
+# ── Main retrieval function ───────────────────────────────────────────────────
 
 def retrieve_context(
     query: str,
-    k: Optional[int] = None,
     collection=None,
     embedder=None,
-    split_by_source: bool = True,
 ) -> RetrievalResult:
     """
-    Main retrieval function — called by chain.py at query time.
+    Embed the query and retrieve TOP_K most relevant chunks from ChromaDB.
 
-    Detects query language, embeds it, and retrieves the most
-    relevant chunks from ChromaDB.
-
-    Two retrieval modes:
-
-    split_by_source=True (default):
-        Fetches SCHEMA_K schema chunks + GLOSSARY_K glossary chunks
-        + KPI_K kpi chunks + RULES_K business_rules chunks separately.
-        Guarantees representation from each source type.
-
-    split_by_source=False:
-        Single query across all source types, returns top-k overall.
-        Faster but may return all results from one source type.
+    FAIL-FAST CONTRACT:
+    - Embedding requests are hard-capped at 15s (set in embeddings.py).
+    - Any exception (timeout, network, ChromaDB) is caught and logged.
+    - On ANY failure, returns an empty RetrievalResult so SQL generation
+      proceeds without RAG context. Never raises, never blocks.
 
     Args:
-        query:            User question (any language).
-        k:                Total results to return (overrides env RAG_TOP_K).
-        collection:       Optional pre-built ChromaDB collection.
-        embedder:         Optional pre-built NVIDIAEmbeddings instance.
-        split_by_source:  Whether to retrieve per source type.
+        query:      User question (any language).
+        collection: Optional pre-built ChromaDB collection.
+        embedder:   Optional pre-built embedder instance.
 
     Returns:
-        RetrievalResult with chunks, language info, and query.
-
-    Raises:
-        RuntimeError: If vector store is empty (indexing hasn't been run).
+        RetrievalResult with chunks and language detection.
     """
+    t_start = time.perf_counter()
+    logger.info("[retriever] Entering RAG retrieval for: %.60s", query)
+
+    lang = _detect_language(query)
+    result = RetrievalResult(query=query, language=lang)
+
     if not query or not query.strip():
-        raise ValueError("❌ retrieve_context received an empty query.")
+        logger.debug("[retriever] Empty query — skipping RAG.")
+        return result
 
-    # Lazy-init shared resources
-    embedder   = embedder   or get_embedder()
-    collection = collection or get_vector_store(client=get_chroma_client())
-
-    if collection.count() == 0:
-        raise RuntimeError(
-            "❌ Vector store is empty. "
-            "Run `python -m rag.indexing` first to populate it."
-        )
-
-    # Detect language (for logging + UI display — doesn't change retrieval)
-    lang_result = detect_language(query)
-    logger.info("🌐 %s", lang_result)
-
-    chunks: list[dict] = []
-
-    if split_by_source:
-        # ── Per-source retrieval ───────────────────────────────────────────────
-        # Fetch from each source type separately so every category is represented
-        source_ks = {
-            "schema":         SCHEMA_K,
-            "glossary":       GLOSSARY_K,
-            "kpi":            KPI_K,
-            "business_rules": RULES_K,
-        }
-
-        seen_ids: set[str] = set()
-
-        for source_type, source_k in source_ks.items():
-            try:
-                results = query_store(
-                    collection,
-                    query_text=query,
-                    k=source_k,
-                    where={"source_type": source_type},
-                    embedder=embedder,
-                )
-                for r in results:
-                    if r["id"] not in seen_ids:
-                        chunks.append(r)
-                        seen_ids.add(r["id"])
-
-                logger.debug(
-                    "  [%s] retrieved %d chunk(s)", source_type, len(results)
-                )
-
-            except Exception as exc:
-                # A source type with no docs raises an error from query_store —
-                # log and continue rather than failing the whole retrieval
-                logger.debug("  [%s] skipped: %s", source_type, exc)
-
-    else:
-        # ── Single-query retrieval ─────────────────────────────────────────────
-        k      = k or RAG_TOP_K
-        chunks = query_store(
-            collection,
-            query_text=query,
-            k=k,
-            embedder=embedder,
-        )
-
-    # Sort final results by distance (most similar first)
-    chunks.sort(key=lambda x: x["distance"])
-
-    logger.info(
-        "✅ Retrieved %d chunk(s) for query: '%s'",
-        len(chunks), query[:60],
-    )
-
-    return RetrievalResult(chunks=chunks, language=lang_result, query=query)
-
-
-# ── Convenience wrapper ────────────────────────────────────────────────────────
-
-def retrieve_as_text(
-    query: str,
-    separator: str = "\n\n---\n\n",
-    **kwargs,
-) -> str:
-    """
-    Retrieve context and return it as a single joined string.
-
-    Used by context_builder.py to assemble the final prompt context block.
-
-    Args:
-        query:     User question.
-        separator: String to join chunks with.
-        **kwargs:  Passed through to retrieve_context().
-
-    Returns:
-        Single string of all retrieved chunks joined by separator.
-    """
-    result = retrieve_context(query, **kwargs)
-    return separator.join(c["text"] for c in result.chunks)
-
-
-# ── Quick test ─────────────────────────────────────────────────────────────────
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-
-    test_queries = [
-        ("English", "Show top 10 customers by revenue"),
-        ("Hindi",   "राजस्व के अनुसार शीर्ष 10 ग्राहक दिखाओ"),
-        ("French",  "Montrez les 10 meilleurs clients par revenus"),
-        ("Spanish", "Mostrar los 10 principales clientes por ingresos"),
-    ]
-
-    print("\n🔍 Retriever Test")
-    print("=" * 60)
-
-    for label, query in test_queries:
-        print(f"\n── [{label}] ──────────────────────────────────────")
-        print(f"Query: {query}")
-
-        try:
-            result = retrieve_context(query)
-            print(f"Language : {result.language}")
-            print(f"Chunks   : {result.total}")
-
-            for i, chunk in enumerate(result.chunks, 1):
-                src  = chunk["metadata"].get("source_type", "?")
-                dist = chunk["distance"]
-                text = chunk["text"][:80].replace("\n", " ")
-                print(f"  {i}. [{src:<15}] dist={dist:.4f} | {text}")
-
-        except RuntimeError as e:
-            print(f"  ⚠️  {e}")
-
-    # Test retrieve_as_text
-    print("\n── retrieve_as_text ───────────────────────────────────")
     try:
-        text_context = retrieve_as_text("top customers by revenue")
-        print(text_context[:300] + "..." if len(text_context) > 300 else text_context)
-    except RuntimeError as e:
-        print(f"  ⚠️  {e}")
+        # ── Collection lookup ─────────────────────────────────────────────
+        if collection is None:
+            from rag.vector_store import get_collection   # noqa: PLC0415
+            collection = get_collection()
+
+        if collection is None:
+            logger.debug("[retriever] ChromaDB collection unavailable — RAG skipped.")
+            return result
+
+        count = collection.count()
+        if count == 0:
+            logger.debug("[retriever] ChromaDB collection is empty — run rag.indexing first.")
+            return result
+
+        # ── Embedding ─────────────────────────────────────────────────────
+        t_embed_start = time.perf_counter()
+        logger.info("[retriever] Embedding request start")
+
+        if embedder is None:
+            from rag.embeddings import embed_text         # noqa: PLC0415
+            query_vector = embed_text(query)
+        else:
+            query_vector = embedder.embed_query(query)
+
+        t_embed_end = time.perf_counter()
+        logger.info("[retriever] Embedding request end (%.2fs)",
+                    t_embed_end - t_embed_start)
+
+        # ── ChromaDB query ────────────────────────────────────────────────
+        t_chroma_start = time.perf_counter()
+        logger.info("[retriever] Chroma query start (top_k=%d, collection_size=%d)",
+                    TOP_K, count)
+
+        results = collection.query(
+            query_embeddings=[query_vector],
+            n_results=min(TOP_K, count),
+            include=["documents", "metadatas", "distances"],
+        )
+
+        t_chroma_end = time.perf_counter()
+        logger.info("[retriever] Chroma query end (%.2fs)",
+                    t_chroma_end - t_chroma_start)
+
+        # ── Parse results ─────────────────────────────────────────────────
+        documents = results.get("documents", [[]])[0]
+        metadatas = results.get("metadatas", [[]])[0]
+        distances = results.get("distances", [[]])[0]
+
+        for doc, meta, dist in zip(documents, metadatas, distances):
+            if not doc or not doc.strip():
+                continue
+
+            # Convert L2 distance → cosine similarity approximation
+            similarity = 1.0 / (1.0 + dist)
+            if similarity < MIN_SCORE:
+                continue
+
+            result.chunks.append({
+                "text":        doc.strip(),
+                "source_type": (meta or {}).get("source_type", "schema"),
+                "filename":    (meta or {}).get("filename", ""),
+                "table_name":  (meta or {}).get("table_name", ""),
+                "distance":    round(dist, 4),
+                "similarity":  round(similarity, 4),
+            })
+
+        logger.info("[retriever] Retrieved %d chunks for query.", result.total)
+
+    except Exception as exc:
+        # ── FAIL-FAST: catch everything, log, return empty result ──────
+        logger.warning("[retriever] RAG retrieval failed (%.2fs): %s",
+                       time.perf_counter() - t_start, exc)
+
+    t_total = time.perf_counter() - t_start
+    logger.info("[retriever] Total retrieval time: %.2fs", t_total)
+
+    return result

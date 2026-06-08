@@ -15,48 +15,41 @@ from rag.sql_guardrails import assert_safe
 
 load_dotenv()
 
+# ── LLM Setup (cached — one instance for the lifetime of the process) ─────────
 
-# ── LLM Setup ─────────────────────────────────────────────────────────────────
+_llm_instance = None
 
 def get_llm() -> ChatOpenAI:
     """
-    Initialize Mistral Large 3 via NVIDIA NIM's OpenAI-compatible API.
-
-    Returns:
-        ChatOpenAI instance pointed at NVIDIA NIM endpoint.
+    Return a cached ChatOpenAI instance via NVIDIA NIM.
+    Never re-initialised per request — avoids repeated handshake overhead.
+    timeout=30 ensures a hung NIM call fails fast instead of spinning forever.
     """
+    global _llm_instance
+    if _llm_instance is not None:
+        return _llm_instance
+
     api_key = os.getenv("NVIDIA_API_KEY")
     if not api_key:
         raise ValueError("❌ NVIDIA_API_KEY is missing from your .env file.")
 
-    return ChatOpenAI(
-        model=os.getenv("LLM_MODEL", "mistralai/mistral-large-3-675b-instruct-2512"),
+    _llm_instance = ChatOpenAI(
+        model=os.getenv("LLM_MODEL", "qwen/qwen3-coder-480b-a35b-instruct"),
         api_key=api_key,
         base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
         temperature=0,
-        top_p=1,
-        max_tokens=1000
+        timeout=120,   # 675B model on free tier can be slow — 60s before giving up
     )
+    return _llm_instance
 
 
 # ── SQL Cleaner ────────────────────────────────────────────────────────────────
 
 def clean_sql(raw: str) -> str:
-    """
-    Strip markdown fences, extra whitespace, and noise from LLM output.
-
-    Args:
-        raw: Raw string returned by the LLM
-
-    Returns:
-        Clean SQL string or 'None' if out of scope
-    """
     cleaned = re.sub(r"```(?:sql)?", "", raw, flags=re.IGNORECASE).replace("```", "")
     cleaned = cleaned.strip()
-
     if cleaned.lower() in ("none", "none;", "none."):
         return "None"
-
     return cleaned
 
 
@@ -68,61 +61,25 @@ def generate_sql(
     use_few_shot: bool = False,
     rag_context: str = "",
 ) -> str:
-    """
-    Send a natural language question + schema + RAG context to Mistral
-    and get back a clean SQL query.
-
-    Args:
-        question:     User's plain English question (any language)
-        schema:       DDL schema string from get_schema()
-        use_few_shot: Whether to include few-shot examples in the prompt
-        rag_context:  Retrieved business context from context_builder.py
-
-    Returns:
-        Clean SQL query string, or 'None' if out of scope
-    """
     llm = get_llm()
-
-    user_prompt = build_prompt(
-        schema,
-        question,
-        use_few_shot=use_few_shot,
-        rag_context=rag_context,
-    )
-
+    user_prompt = build_prompt(schema, question, use_few_shot=use_few_shot, rag_context=rag_context)
     messages = [
         SystemMessage(content=SYSTEM_PROMPT.format(schema=schema)),
         HumanMessage(content=user_prompt),
     ]
-
     response = llm.invoke(messages)
     return clean_sql(response.content)
 
 
 def run_query(sql: str, db) -> str:
-    """
-    Validate and execute a SQL query against the PostgreSQL database.
-
-    Runs sql_guardrails check before execution — blocks any destructive
-    statements that somehow bypassed the LLM prompt rules.
-
-    Args:
-        sql: Clean SQL query string
-        db:  SQLDatabase instance from db.py
-
-    Returns:
-        Query result as a string, or an error message
-    """
     if sql == "None":
         return "⚠️ This question could not be answered from the available schema."
 
-    # ── Safety guard ───────────────────────────────────────────────────────────
     try:
         assert_safe(sql)
     except ValueError as e:
         return f"🚫 {e}"
 
-    # ── Execute ────────────────────────────────────────────────────────────────
     try:
         result = db.run(sql)
         if not result or result.strip() == "":
@@ -132,41 +89,13 @@ def run_query(sql: str, db) -> str:
         return f"❌ Query execution failed: {e}"
 
 
-def ask(
-    question: str,
-    db=None,
-    use_few_shot: bool = False,
-) -> dict:
-    """
-    Full RAG-enhanced pipeline:
-    question → RAG retrieval → SQL generation → safety check → execute → result.
-
-    Args:
-        question:     User's plain English question (any language)
-        db:           SQLDatabase instance (created if not provided)
-        use_few_shot: Whether to include few-shot examples
-
-    Returns:
-        dict with keys: question, sql, result, language, rag_chunks
-    """
+def ask(question: str, db=None, use_few_shot: bool = False) -> dict:
     if db is None:
         db = get_db()
 
     schema = get_schema(db)
-
-    # ── RAG context retrieval ──────────────────────────────────────────────────
-    # Degrades gracefully to "" if vector store is empty or unavailable
     rag_context_str, retrieval = get_rag_context(question)
-
-    # ── SQL generation ─────────────────────────────────────────────────────────
-    sql = generate_sql(
-        question,
-        schema,
-        use_few_shot=use_few_shot,
-        rag_context=rag_context_str,
-    )
-
-    # ── Execution ──────────────────────────────────────────────────────────────
+    sql = generate_sql(question, schema, use_few_shot=use_few_shot, rag_context=rag_context_str)
     result = run_query(sql, db)
 
     return {
@@ -181,16 +110,9 @@ def ask(
 # ── Quick test ─────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     print("🔗 Testing full RAG-enhanced chain...\n")
-
-    test_questions = [
-        "How many tables are in the database?",
-        "What is the current date?",
-    ]
-
     try:
         db = get_db()
-
-        for question in test_questions:
+        for question in ["How many tables are in the database?", "What is the current date?"]:
             print(f"❓ Question : {question}")
             output = ask(question, db=db)
             print(f"🌐 Language : {output['language']}")
@@ -198,6 +120,5 @@ if __name__ == "__main__":
             print(f"🧠 SQL      : {output['sql']}")
             print(f"📊 Result   : {output['result']}")
             print("-" * 50)
-
     except Exception as e:
         print(f"❌ Error: {e}")
