@@ -379,7 +379,7 @@ with st.sidebar:
     st.markdown("---")
     st.markdown(
         '<p style="font-size:.75rem;color:#334155;font-family:JetBrains Mono,monospace;">'
-        'Mistral Large 3 · 675B<br>NVIDIA NIM Free Tier</p>',
+        'Qwen 3 Coder · 480B<br>NVIDIA NIM Free Tier</p>',
         unsafe_allow_html=True,
     )
 
